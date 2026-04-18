@@ -138,12 +138,20 @@ def run():
                 if slug:
                     trade["market_url"] = f"https://polymarket.com/event/{slug}"
 
-                # Get 24hr volume from market info
+                # Get 24hr volume from market info — try all known field names
                 volume_24h = 0.0
                 try:
-                    volume_24h = float(info.get("volume24hr") or info.get("volume_24hr") or 0)
+                    volume_24h = float(
+                        info.get("volume24hr") or
+                        info.get("volume_24hr") or
+                        info.get("volumeNum") or
+                        info.get("volume") or
+                        0
+                    )
                 except Exception:
                     pass
+                if volume_24h == 0:
+                    log.debug(f"No volume for {cid}: info keys={list(info.keys())[:10]}")
 
                 # Get current price for price movement signal
                 price_after = 0.0

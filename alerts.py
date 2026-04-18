@@ -1,6 +1,7 @@
+import re
 import logging
 import requests
-from config import DISCORD_WEBHOOK_URL
+from config import DISCORD_WEBHOOK_URL, BOT_TOKEN
 from scorer import Score
 
 log = logging.getLogger(__name__)
@@ -21,40 +22,132 @@ def _pnl(v: float) -> str:
 def _short(addr: str) -> str:
     return f"{addr[:6]}...{addr[-4:]}" if len(addr) > 10 else addr
 
+def _market_key(title: str) -> str:
+    """Strip O/U lines and suffixes so related markets group into same thread."""
+    return re.split(r'[:\|]', title)[0].strip() or title
+
 
 class Alerter:
+    def __init__(self):
+        self.active_threads: dict[str, str] = {}  # market_key -> thread_id
+        self._channel_id: str | None = None
+
+    def _get_channel_id(self) -> str | None:
+        """Fetch channel ID from webhook URL once and cache it."""
+        if self._channel_id:
+            return self._channel_id
+        try:
+            r = requests.get(DISCORD_WEBHOOK_URL, timeout=5)
+            r.raise_for_status()
+            self._channel_id = str(r.json().get("channel_id", ""))
+            return self._channel_id
+        except Exception as e:
+            log.warning(f"Could not fetch channel ID: {e}")
+            return None
+
+    def _bot_headers(self) -> dict:
+        return {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
+
+    def _post_to_channel(self, embed: dict) -> str | None:
+        """Post to main channel via webhook, return message ID."""
+        try:
+            r = requests.post(
+                DISCORD_WEBHOOK_URL,
+                json={"embeds": [embed]},
+                params={"wait": "true"},
+                timeout=5
+            )
+            r.raise_for_status()
+            return str(r.json().get("id", ""))
+        except Exception as e:
+            log.error(f"Failed to post to channel: {e}")
+            return None
+
+    def _create_thread(self, message_id: str, thread_name: str) -> str | None:
+        """Create a thread on a message using the bot token."""
+        channel_id = self._get_channel_id()
+        if not channel_id or not BOT_TOKEN:
+            return None
+        try:
+            r = requests.post(
+                f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}/threads",
+                headers=self._bot_headers(),
+                json={
+                    "name": thread_name[:100],
+                    "auto_archive_duration": 1440,  # archive after 1 day of inactivity
+                },
+                timeout=5
+            )
+            r.raise_for_status()
+            thread_id = str(r.json().get("id", ""))
+            log.info(f"Created thread '{thread_name}' id={thread_id}")
+            return thread_id
+        except Exception as e:
+            log.warning(f"Thread creation failed: {e}")
+            return None
+
+    def _post_to_thread(self, thread_id: str, embed: dict) -> bool:
+        """Post embed into an existing thread via webhook thread_id param."""
+        try:
+            r = requests.post(
+                DISCORD_WEBHOOK_URL,
+                json={"embeds": [embed]},
+                params={"thread_id": thread_id},
+                timeout=5
+            )
+            if r.status_code == 404:
+                return False
+            r.raise_for_status()
+            return True
+        except Exception as e:
+            log.warning(f"Failed to post to thread {thread_id}: {e}")
+            return False
+
     def send(self, trade: dict, s: Score):
         if not DISCORD_WEBHOOK_URL:
             self._console(trade, s)
             return
 
+        embed = self._build_embed(trade, s)
+        market_key = _market_key(trade["market_title"])
+        thread_id = self.active_threads.get(market_key)
+
+        if thread_id:
+            success = self._post_to_thread(thread_id, embed)
+            if not success:
+                # Thread gone, remove and recreate below
+                del self.active_threads[market_key]
+                thread_id = None
+
+        if not thread_id:
+            msg_id = self._post_to_channel(embed)
+            if msg_id:
+                new_thread_id = self._create_thread(msg_id, f"🐋 {market_key}")
+                if new_thread_id:
+                    self.active_threads[market_key] = new_thread_id
+
+    def _build_embed(self, trade: dict, s: Score) -> dict:
         usd    = trade["usd"]
         side   = trade["outcome"]
         wallet = trade["wallet"]
         pnl    = trade["pnl"]
         side_e = "🟢" if "YES" in side.upper() else "🔴"
 
-        # Volume context line
         vol = trade.get("volume_24h", 0)
         vol_str = f"${vol:,.0f} 24h vol" if vol > 0 else "volume unknown"
 
-        # Price movement line
         pa = trade.get("price_after", 0)
         pc = trade["price_cents"]
         if pa > 0 and pc > 0:
-            if "YES" in side.upper():
-                diff = pa - pc
-            else:
-                diff = pc - pa
+            diff = (pa - pc) if "YES" in side.upper() else (pc - pa)
             move_str = f"{'▲' if diff > 0 else '▼'} {abs(diff):.1f}¢ after trade"
         else:
             move_str = "price data unavailable"
 
-        # Consensus line
         sw = trade.get("same_side_whales", 0)
-        cons_str = f"{sw + 1} whale{'s' if sw > 0 else ''} on this side" if sw > 0 else "first whale on this side"
+        cons_str = f"{sw + 1} whales on this side" if sw > 0 else "first whale on this side"
 
-        embed = {
+        return {
             "title": f"{s.emoji} {s.label} — Polymarket Whale",
             "color": COLORS.get(s.label, 0x888888),
             "fields": [
@@ -92,15 +185,6 @@ class Alerter:
             ],
             "footer": {"text": "Polymarket Whale Alert"},
         }
-
-        try:
-            r = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=5)
-            r.raise_for_status()
-            log.info(f"✅ Alert: ${usd:,.0f} {side} @ {trade['price_cents']:.1f}¢ "
-                     f"[{s.total}/100] — {trade['market_title'][:50]}")
-        except Exception as e:
-            log.error(f"Discord failed: {e}")
-            self._console(trade, s)
 
     def _console(self, trade: dict, s: Score):
         print(f"\n{'='*60}")

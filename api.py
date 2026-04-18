@@ -103,25 +103,39 @@ def get_market_by_condition(condition_id: str) -> dict:
 
 
 def get_market_by_event_slug(event_slug: str) -> dict:
-    """Fetch market info by eventSlug — often more reliable than conditionId."""
+    """
+    Fetch event info by eventSlug and return the highest-volume market.
+    This correctly gets ML volume instead of a sub-market volume.
+    """
     data = _get(f"{GAMMA}/events", {"slug": event_slug})
-    if isinstance(data, list) and data:
-        event = data[0]
-        markets = event.get("markets", [])
-        if markets:
-            # Return the event-level volume which is more accurate
-            result = markets[0].copy()
-            result["volume24hr"] = float(event.get("volume24hr") or event.get("volume") or 0)
-            result["question"] = event.get("title") or result.get("question", "")
-            return result
-    if isinstance(data, dict):
-        markets = data.get("markets", [])
-        if markets:
-            result = markets[0].copy()
-            result["volume24hr"] = float(data.get("volume24hr") or data.get("volume") or 0)
-            result["question"] = data.get("title") or result.get("question", "")
-            return result
-    return {}
+    events = data if isinstance(data, list) else ([data] if isinstance(data, dict) and data else [])
+    if not events:
+        return {}
+
+    event = events[0]
+    markets = event.get("markets", [])
+
+    # Use event-level volume as the authoritative number
+    event_volume = float(event.get("volume24hr") or event.get("volume") or 0)
+
+    if markets:
+        # Pick the highest-volume sub-market (usually the moneyline)
+        best = max(markets, key=lambda m: float(m.get("volume24hr") or m.get("volume") or 0))
+        result = best.copy()
+        # Use event-level volume if higher (more accurate for ML)
+        result["volume24hr"] = max(
+            event_volume,
+            float(best.get("volume24hr") or 0)
+        )
+        result["question"] = event.get("title") or best.get("question", "")
+        return result
+
+    # No markets, return event info directly
+    return {
+        "question": event.get("title", ""),
+        "volume24hr": event_volume,
+        "outcomePrices": None,
+    }
 
 
 def batch_get_activity(wallets: list[str], limit: int = 10) -> dict[str, list]:

@@ -95,12 +95,14 @@ def get_wallet_profile(address: str) -> dict:
 
 
 def get_market_by_condition(condition_id: str) -> dict:
-    """Returns market question/title/slug from Gamma API."""
-    data = _get(f"{GAMMA}/markets", {"id": condition_id})
-    if isinstance(data, list) and data:
-        return data[0]
-    if isinstance(data, dict):
-        return data.get("markets", [{}])[0] if data.get("markets") else data
+    """Returns market question/title/slug/volume from Gamma API."""
+    # Try by conditionId first
+    for param in [{"id": condition_id}, {"condition_id": condition_id}, {"conditionIds": condition_id}]:
+        data = _get(f"{GAMMA}/markets", param)
+        if isinstance(data, list) and data:
+            return data[0]
+        if isinstance(data, dict) and data.get("markets"):
+            return data["markets"][0]
     return {}
 
 

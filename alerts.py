@@ -188,11 +188,11 @@ class Alerter:
                  "inline": False},
                 {"name": "🔬 Breakdown",
                  "value": (
-                     f"Credibility: `{s.credibility}/30` • "
-                     f"Vol Share: `{s.dominance}/25` • "
-                     f"Conviction: `{s.conviction}/20` • "
-                     f"Mkt Move: `{s.price_move}/15` • "
-                     f"Consensus: `{s.consensus}/10`"
+                     f"Credibility: `{s.credibility}/40` • "
+                     f"Vol Share: `{s.dominance}/35` • "
+                     f"Conviction: `{s.conviction}/25` • "
+                     f"Mkt Move: `{s.price_move:+d}` • "
+                     f"Consensus: `{s.consensus:+d}`"
                  ),
                  "inline": False},
                 {"name": "📈 Context",

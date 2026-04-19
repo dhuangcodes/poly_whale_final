@@ -2,7 +2,8 @@ import re
 import logging
 import requests
 from datetime import datetime, timezone, timedelta
-from config import DISCORD_WEBHOOK_URL, DISCORD_BOT_AUTH as BOT_TOKEN
+from config import (WEBHOOK_NBA, WEBHOOK_MLB, WEBHOOK_TENNIS,
+                    WEBHOOK_VIDEOGAMES, WEBHOOK_OTHER)
 from scorer import Score
 
 log = logging.getLogger(__name__)
@@ -14,19 +15,69 @@ COLORS = {
     "INFORMATIONAL": 0x888888,
 }
 
+# Keywords to route alerts to the right channel
+NBA_TEAMS = [
+    "hawks", "celtics", "nets", "hornets", "bulls", "cavaliers", "mavericks",
+    "nuggets", "pistons", "warriors", "rockets", "pacers", "clippers", "lakers",
+    "grizzlies", "heat", "bucks", "timberwolves", "pelicans", "knicks", "thunder",
+    "magic", "76ers", "suns", "trail blazers", "blazers", "kings", "spurs",
+    "raptors", "jazz", "wizards", "nba", "o/u", "over/under"
+]
+MLB_TEAMS = [
+    "yankees", "red sox", "dodgers", "giants", "cubs", "white sox", "reds",
+    "indians", "guardians", "rockies", "tigers", "astros", "royals", "angels",
+    "marlins", "brewers", "twins", "mets", "phillies", "pirates", "padres",
+    "cardinals", "rays", "rangers", "blue jays", "nationals", "orioles",
+    "athletics", "mariners", "braves", "mlb"
+]
+TENNIS_KEYWORDS = [
+    "atp", "wta", "vs", "open", "wimbledon", "roland garros", "us open",
+    "australian open", "grand slam", "challenger", "wuning", "tennis"
+]
+VIDEOGAME_KEYWORDS = [
+    "cs2", "csgo", "valorant", "league of legends", "lol", "dota", "fortnite",
+    "overwatch", "call of duty", "cod", "navi", "natus vincere", "faze", "vitality",
+    "astralis", "g2", "fnatic", "team liquid", "esport", "gaming", "major",
+    "blast", "pgl", "iem", "esl", "map", "rounds"
+]
+
+
+def _get_webhook(market_title: str) -> str:
+    """Route alert to correct channel based on market title keywords."""
+    title_lower = market_title.lower()
+
+    # Check NBA first
+    for team in NBA_TEAMS:
+        if team in title_lower:
+            return WEBHOOK_NBA
+
+    # Check MLB
+    for team in MLB_TEAMS:
+        if team in title_lower:
+            return WEBHOOK_MLB
+
+    # Check esports/video games
+    for kw in VIDEOGAME_KEYWORDS:
+        if kw in title_lower:
+            return WEBHOOK_VIDEOGAMES
+
+    # Check tennis — "X vs Y" pattern with no team sports context
+    for kw in TENNIS_KEYWORDS:
+        if kw in title_lower:
+            return WEBHOOK_TENNIS
+
+    # Fallback
+    return WEBHOOK_OTHER
+
+
 def _bar(n: int) -> str:
-    return "█" * round(n/10) + "░" * (10 - round(n/10))
+    return "█" * round(n / 10) + "░" * (10 - round(n / 10))
 
 def _pnl(v: float) -> str:
     return f"+${v:,.0f}" if v >= 0 else f"-${abs(v):,.0f}"
 
 def _short(addr: str) -> str:
     return f"{addr[:6]}...{addr[-4:]}" if len(addr) > 10 else addr
-
-def _market_key(title: str) -> str:
-    return re.split(r'[:\|]', title)[0].strip() or title
-
-
 
 def _format_est(ts: int) -> str:
     if not ts:
@@ -35,131 +86,39 @@ def _format_est(ts: int) -> str:
     dt = datetime.fromtimestamp(ts, tz=est)
     return dt.strftime("%b %d %I:%M %p EST")
 
+
 class Alerter:
     def __init__(self):
-        self.active_threads: dict[str, str] = {}
-        self._channel_id: str | None = None
-
-    def _get_channel_id(self) -> str | None:
-        if self._channel_id:
-            return self._channel_id
-        try:
-            r = requests.get(DISCORD_WEBHOOK_URL, timeout=5)
-            r.raise_for_status()
-            data = r.json()
-            self._channel_id = str(data.get("channel_id", ""))
-            log.info(f"Got channel_id: {self._channel_id}")
-            return self._channel_id
-        except Exception as e:
-            log.error(f"Could not fetch channel ID: {e}")
-            return None
-
-    def _bot_headers(self) -> dict:
-        return {"Authorization": f"Bot {BOT_TOKEN}", "Content-Type": "application/json"}
-
-    def _post_to_channel(self, embed: dict) -> str | None:
-        try:
-            r = requests.post(
-                DISCORD_WEBHOOK_URL,
-                json={"embeds": [embed]},
-                params={"wait": "true"},
-                timeout=5
-            )
-            r.raise_for_status()
-            msg_id = str(r.json().get("id", ""))
-            log.info(f"Posted to channel, msg_id={msg_id}")
-            return msg_id
-        except Exception as e:
-            log.error(f"Failed to post to channel: {e}")
-            return None
-
-    def _create_thread(self, message_id: str, thread_name: str) -> str | None:
-        if not BOT_TOKEN:
-            log.error("BOT_TOKEN (DISCORD_BOT_AUTH) is empty — cannot create threads")
-            return None
-
-        channel_id = self._get_channel_id()
-        if not channel_id:
-            log.error("No channel_id — cannot create thread")
-            return None
-
-        log.info(f"Creating thread '{thread_name}' on msg {message_id} in channel {channel_id}")
-        try:
-            r = requests.post(
-                f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}/threads",
-                headers=self._bot_headers(),
-                json={
-                    "name": thread_name[:100],
-                    "auto_archive_duration": 1440,
-                },
-                timeout=5
-            )
-            log.info(f"Thread creation response: {r.status_code} {r.text[:200]}")
-            r.raise_for_status()
-            thread_id = str(r.json().get("id", ""))
-            log.info(f"✅ Created thread '{thread_name}' id={thread_id}")
-            return thread_id
-        except Exception as e:
-            log.error(f"Thread creation failed: {e}")
-            return None
-
-    def _post_to_thread(self, thread_id: str, embed: dict) -> bool:
-        try:
-            r = requests.post(
-                DISCORD_WEBHOOK_URL,
-                json={"embeds": [embed]},
-                params={"thread_id": thread_id},
-                timeout=5
-            )
-            if r.status_code == 404:
-                log.warning(f"Thread {thread_id} not found (404)")
-                return False
-            r.raise_for_status()
-            log.info(f"Posted to thread {thread_id}")
-            return True
-        except Exception as e:
-            log.warning(f"Failed to post to thread {thread_id}: {e}")
-            return False
+        pass  # no threads needed anymore
 
     def send(self, trade: dict, s: Score):
-        if not DISCORD_WEBHOOK_URL:
+        webhook = _get_webhook(trade["market_title"])
+        if not webhook:
             self._console(trade, s)
             return
 
         embed = self._build_embed(trade, s)
-        market_key = _market_key(trade["market_title"])
-        thread_id = self.active_threads.get(market_key)
-
-        log.info(f"Sending alert for '{market_key}' (thread_id={thread_id})")
-
-        if thread_id:
-            success = self._post_to_thread(thread_id, embed)
-            if not success:
-                del self.active_threads[market_key]
-                thread_id = None
-
-        if not thread_id:
-            msg_id = self._post_to_channel(embed)
-            if msg_id:
-                new_thread_id = self._create_thread(msg_id, f"🐋 {market_key}")
-                if new_thread_id:
-                    self.active_threads[market_key] = new_thread_id
-                    log.info(f"Stored thread for '{market_key}'")
+        try:
+            r = requests.post(webhook, json={"embeds": [embed]}, timeout=5)
+            r.raise_for_status()
+            log.info(f"✅ [{_route_name(trade['market_title'])}] "
+                     f"${trade['usd']:,.0f} {trade['outcome']} @ {trade['price_cents']:.1f}¢ "
+                     f"[{s.total}/100] — {trade['market_title'][:50]}")
+        except Exception as e:
+            log.error(f"Discord failed: {e}")
+            self._console(trade, s)
 
     def _build_embed(self, trade: dict, s: Score) -> dict:
         usd    = trade["usd"]
         side   = trade["outcome"]
         wallet = trade["wallet"]
         pnl    = trade["pnl"]
-        side_e = "🟢" if "YES" in side.upper() else "🔴"
-
-        vol = trade.get("volume_24h", 0)
-        vol_str = f"${vol:,.0f} 24h vol" if vol > 0 else "volume unknown"
+        side_e = "🟢" if side in ("YES", "OVER") or (len(side) > 2 and side not in ("NO", "UNDER")) else "🔴"
 
         pa = trade.get("price_after", 0)
         pc = trade["price_cents"]
         if pa > 0 and pc > 0:
-            diff = (pa - pc) if "YES" in side.upper() else (pc - pa)
+            diff = (pa - pc) if side in ("YES",) else (pc - pa)
             move_str = f"{'▲' if diff > 0 else '▼'} {abs(diff):.1f}¢ after trade"
         else:
             move_str = "price data unavailable"
@@ -195,7 +154,7 @@ class Alerter:
                  ),
                  "inline": False},
                 {"name": "📈 Context",
-                 "value": f"{vol_str}  |  {move_str}  |  {cons_str}",
+                 "value": f"{move_str}  |  {cons_str}",
                  "inline": False},
                 {"name": "🔗 Links",
                  "value": (f"[Market]({trade['market_url']}) • "
@@ -215,3 +174,17 @@ class Alerter:
         print(f"Reason : {s.reason}")
         print(f"Link   : {trade['market_url']}")
         print(f"{'='*60}\n")
+
+
+def _route_name(title: str) -> str:
+    """Human readable channel name for logging."""
+    t = title.lower()
+    for team in NBA_TEAMS:
+        if team in t: return "NBA"
+    for team in MLB_TEAMS:
+        if team in t: return "MLB"
+    for kw in VIDEOGAME_KEYWORDS:
+        if kw in t: return "GAMES"
+    for kw in TENNIS_KEYWORDS:
+        if kw in t: return "TENNIS"
+    return "OTHER"

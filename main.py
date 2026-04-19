@@ -90,9 +90,6 @@ def run():
     log.info(f"Threshold: ${MIN_TRADE_USD:,.0f} | Top {TOP_WALLETS_COUNT} wallets")
 
     alerter       = Alerter()
-    # Load persisted threads so we don't create duplicates after restarts
-    alerter.active_threads = load_threads()
-    log.info(f"Loaded {len(alerter.active_threads)} existing threads from disk")
 
     seen          = set()
     profile_cache = {}
@@ -221,8 +218,7 @@ def run():
 
                 alerter.send(trade, s)
 
-                # Persist threads after every alert
-                save_threads(alerter.active_threads)
+
 
             if wallet_idx < BATCH_SIZE:
                 last_ts = now - 60

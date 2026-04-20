@@ -98,6 +98,11 @@ def run():
     log.info(f"Loaded {len(active_threads)} threads, {len(known_wallets)} tracked wallets")
 
     alerter        = Alerter(active_threads)
+
+    # Load existing Discord threads on startup to avoid duplicates after restart
+    if WEBHOOK_NBA:
+        alerter.load_existing_threads(WEBHOOK_NBA)
+
     seen           = set()
     profile_cache  = {}
     market_cache   = {}

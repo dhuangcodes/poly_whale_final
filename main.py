@@ -64,7 +64,9 @@ def parse(raw: dict, wallet: str, profile: dict) -> dict | None:
         title      = raw.get("title", "")
         tx         = raw.get("transactionHash", "")
         ts         = int(raw.get("timestamp", 0))
-        tid        = tx or f"{wallet}-{ts}-{usd}"
+        # Use tx hash if available, otherwise bucket by wallet+condition+timestamp+rounded size
+        # Rounding usd to nearest 100 groups Polymarket order splits (same order, multiple fills)
+        tid = tx or f"{wallet}-{condition}-{ts}-{round(usd, -2)}"
 
         return {
             "id":           tid,

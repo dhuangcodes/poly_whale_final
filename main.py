@@ -4,7 +4,7 @@ import logging
 import os
 from collections import defaultdict
 from datetime import datetime, timezone
-from api import (get_leaderboard, batch_get_activity, get_wallet_profile,
+from api import (get_leaderboard, batch_get_activity,
                  get_market_by_condition, get_market_by_event_slug)
 from scorer import score
 from alerts import Alerter
@@ -23,27 +23,28 @@ log = logging.getLogger(__name__)
 WALLET_REFRESH   = 6 * 3600
 BATCH_SIZE       = 30
 CONSENSUS_WINDOW = 3600
-THREADS_FILE     = "active_threads.json"
+
+# Use /tmp for persistence — survives Railway restarts better than working dir
+THREADS_FILE = "/tmp/whale_threads.json"
+WALLETS_FILE = "/tmp/whale_wallets.json"
 
 
-def load_threads() -> dict:
-    """Load persisted thread IDs from disk."""
+def load_json(path: str, default):
     try:
-        if os.path.exists(THREADS_FILE):
-            with open(THREADS_FILE) as f:
+        if os.path.exists(path):
+            with open(path) as f:
                 return json.load(f)
     except Exception as e:
-        log.warning(f"Could not load threads file: {e}")
-    return {}
+        log.warning(f"Could not load {path}: {e}")
+    return default
 
 
-def save_threads(threads: dict):
-    """Persist thread IDs to disk so they survive restarts."""
+def save_json(path: str, data):
     try:
-        with open(THREADS_FILE, "w") as f:
-            json.dump(threads, f)
+        with open(path, "w") as f:
+            json.dump(data, f)
     except Exception as e:
-        log.warning(f"Could not save threads file: {e}")
+        log.warning(f"Could not save {path}: {e}")
 
 
 def parse(raw: dict, wallet: str, profile: dict) -> dict | None:
@@ -56,7 +57,7 @@ def parse(raw: dict, wallet: str, profile: dict) -> dict | None:
             return None
 
         raw_outcome = raw.get("outcome", raw.get("side", "?"))
-        outcome = str(raw_outcome).upper() if raw_outcome else "?"
+        outcome     = str(raw_outcome).upper() if raw_outcome else "?"
 
         condition  = raw.get("conditionId", "")
         event_slug = raw.get("eventSlug") or raw.get("slug") or ""
@@ -89,39 +90,60 @@ def run():
     log.info("🐳 Polymarket Whale Alert Bot Starting")
     log.info(f"Threshold: ${MIN_TRADE_USD:,.0f} | Top {TOP_WALLETS_COUNT} wallets")
 
-    alerter       = Alerter()
+    # Load persisted state
+    active_threads = load_json(THREADS_FILE, {})
+    known_wallets  = load_json(WALLETS_FILE, {})  # addr -> pnl
+    log.info(f"Loaded {len(active_threads)} threads, {len(known_wallets)} tracked wallets")
 
-    seen          = set()
-    profile_cache = {}
-    market_cache  = {}  # event_slug -> market info
-    wallets       = []
-    wallet_idx    = 0
-    last_refresh  = 0
-    last_ts       = int(datetime.now(timezone.utc).timestamp()) - 60
+    alerter        = Alerter(active_threads)
+    seen           = set()
+    profile_cache  = {}
+    market_cache   = {}
+    wallets        = []
+    wallet_idx     = 0
+    last_refresh   = 0
+    last_ts        = int(datetime.now(timezone.utc).timestamp()) - 60
     consensus_log: dict[str, list] = defaultdict(list)
 
     while True:
         try:
             now = int(datetime.now(timezone.utc).timestamp())
 
+            # Refresh leaderboard + merge with known wallets
             if now - last_refresh > WALLET_REFRESH or not wallets:
                 log.info("Refreshing leaderboard...")
                 board = get_leaderboard(limit=TOP_WALLETS_COUNT)
-                wallets = []
+
+                # Build fresh profile cache from leaderboard
                 for e in board:
                     addr = (e.get("proxyWallet") or e.get("address", "")).lower()
                     if addr:
-                        wallets.append(addr)
-                        profile_cache[addr] = {"pnl": float(e.get("pnl", 0) or 0)}
+                        pnl = float(e.get("pnl", 0) or 0)
+                        profile_cache[addr] = {"pnl": pnl}
+                        known_wallets[addr] = pnl  # update known wallets
+
+                # Merge leaderboard + known wallets into poll list
+                leaderboard_addrs = set(profile_cache.keys())
+                extra_addrs = set(known_wallets.keys()) - leaderboard_addrs
+                wallets = list(leaderboard_addrs) + list(extra_addrs)
+
+                # Make sure extra wallets have a profile entry
+                for addr in extra_addrs:
+                    if addr not in profile_cache:
+                        profile_cache[addr] = {"pnl": known_wallets[addr]}
+
                 last_refresh = now
-                log.info(f"Monitoring {len(wallets)} wallets")
+                save_json(WALLETS_FILE, known_wallets)
+                log.info(f"Monitoring {len(wallets)} wallets "
+                         f"({len(leaderboard_addrs)} leaderboard + "
+                         f"{len(extra_addrs)} auto-tracked)")
 
             if not wallets:
                 time.sleep(60)
                 continue
 
-            batch = wallets[wallet_idx: wallet_idx + BATCH_SIZE]
-            wallet_idx = (wallet_idx + BATCH_SIZE) % len(wallets)
+            batch       = wallets[wallet_idx: wallet_idx + BATCH_SIZE]
+            wallet_idx  = (wallet_idx + BATCH_SIZE) % len(wallets)
 
             activity_map = batch_get_activity(batch, limit=10)
             new_whales   = []
@@ -147,12 +169,11 @@ def run():
                     new_whales.append(trade)
 
             for trade in new_whales:
-                # Use eventSlug for market lookup — gives event-level volume
                 event_slug = trade["event_slug"]
                 cache_key  = event_slug or trade["condition"]
+                info       = {}
 
                 if cache_key and cache_key not in market_cache:
-                    info = {}
                     if event_slug:
                         info = get_market_by_event_slug(event_slug) or {}
                     if not info and trade["condition"]:
@@ -162,12 +183,10 @@ def run():
                 else:
                     info = market_cache.get(cache_key, {})
 
-                # Only update title if we got a better one from Gamma
                 gamma_title = info.get("question") or info.get("title") or ""
                 if gamma_title and len(gamma_title) > len(trade["market_title"]):
                     trade["market_title"] = gamma_title
 
-                # Volume — event-level is most accurate
                 volume_24h = 0.0
                 try:
                     volume_24h = float(
@@ -178,7 +197,6 @@ def run():
                 except Exception:
                     pass
 
-                # Current price for movement signal
                 price_after = 0.0
                 try:
                     outcome_prices = info.get("outcomePrices")
@@ -192,14 +210,14 @@ def run():
                 except Exception:
                     pass
 
-                # Consensus
-                cid = trade["condition"]
+                cid    = trade["condition"]
                 cutoff = now - CONSENSUS_WINDOW
                 consensus_log[cid] = [
                     (t, s, w) for t, s, w in consensus_log[cid]
                     if t > cutoff and w != trade["wallet"]
                 ]
-                same_side = sum(1 for t, s, w in consensus_log[cid] if s == trade["outcome"])
+                same_side = sum(1 for t, s, w in consensus_log[cid]
+                                if s == trade["outcome"])
                 consensus_log[cid].append((now, trade["outcome"], trade["wallet"]))
 
                 s = score(
@@ -216,9 +234,18 @@ def run():
                 trade["price_after"]      = price_after
                 trade["same_side_whales"] = same_side
 
-                alerter.send(trade, s)
+                new_thread = alerter.send(trade, s)
 
+                # Auto-grow: save wallet to known list
+                wallet_addr = trade["wallet"]
+                if wallet_addr not in known_wallets:
+                    known_wallets[wallet_addr] = trade["pnl"]
+                    log.info(f"Auto-tracked new wallet: {wallet_addr} (PnL: {trade['pnl']:,.0f})")
+                    save_json(WALLETS_FILE, known_wallets)
 
+                # Save threads if a new one was created
+                if new_thread:
+                    save_json(THREADS_FILE, active_threads)
 
             if wallet_idx < BATCH_SIZE:
                 last_ts = now - 60
@@ -228,14 +255,19 @@ def run():
                 total_batches = max(1, len(wallets) // BATCH_SIZE)
                 log.info(f"No whale trades (batch {batch_num}/{total_batches})")
 
+            # Cleanup
             if len(seen) > 20_000:
                 seen = set(list(seen)[-5000:])
-            if len(profile_cache) > 1000:
-                profile_cache.clear()
+            if len(profile_cache) > 2000:
+                profile_cache = {k: v for k, v in profile_cache.items()
+                                 if k in known_wallets}
             if len(market_cache) > 500:
                 market_cache.clear()
             for cid in list(consensus_log.keys()):
-                consensus_log[cid] = [(t, s, w) for t, s, w in consensus_log[cid] if t > now - CONSENSUS_WINDOW]
+                consensus_log[cid] = [
+                    (t, s, w) for t, s, w in consensus_log[cid]
+                    if t > now - CONSENSUS_WINDOW
+                ]
 
         except Exception as e:
             log.error(f"Loop error: {e}", exc_info=True)

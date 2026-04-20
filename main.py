@@ -8,7 +8,7 @@ from api import (get_leaderboard, batch_get_activity,
                  get_market_by_condition, get_market_by_event_slug)
 from scorer import score
 from alerts import Alerter
-from config import MIN_TRADE_USD, POLL_INTERVAL, TOP_WALLETS_COUNT
+from config import MIN_TRADE_USD, POLL_INTERVAL, TOP_WALLETS_COUNT, WEBHOOK_NBA
 
 logging.basicConfig(
     level=logging.INFO,

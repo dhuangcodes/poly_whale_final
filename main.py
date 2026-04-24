@@ -9,6 +9,7 @@ from api import (get_leaderboard, batch_get_activity,
 from scorer import score
 from alerts import Alerter
 from config import MIN_TRADE_USD, POLL_INTERVAL, TOP_WALLETS_COUNT
+from summarizer import GameSummaryStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +27,9 @@ CONSENSUS_WINDOW = 3600
 
 # Use /tmp for persistence — survives Railway restarts better than working dir
 WALLETS_FILE = "/tmp/whale_wallets.json"
+
+# Global summary store — persists in memory across poll cycles
+summary_store = GameSummaryStore(ttl_hours=20)
 
 
 def load_json(path: str, default):
@@ -236,6 +240,19 @@ def run():
 
                 alerter.send(trade, s)
 
+                # Feed summary store
+                summary_store.add_alert(
+                    title       = trade.get("market_title", trade.get("question", "")),
+                    side        = trade.get("outcome", ""),
+                    price_cents = trade.get("price_cents", 0),
+                    usd         = trade.get("usd", 0),
+                    wallet      = trade.get("wallet", ""),
+                    pnl         = trade.get("pnl", 0),
+                    score_total = s.total,
+                    score_label = s.label,
+                    ts          = trade.get("timestamp", int(__import__("time").time())),
+                )
+
                 # Auto-grow: save wallet to known list
                 wallet_addr = trade["wallet"]
                 if wallet_addr not in known_wallets:
@@ -268,6 +285,14 @@ def run():
 
         except Exception as e:
             log.error(f"Loop error: {e}", exc_info=True)
+
+        # Persist summary store to disk for get_summary.py
+        try:
+            import pickle
+            with open("/tmp/summary_store.pkl", "wb") as _f:
+                pickle.dump(summary_store, _f)
+        except Exception:
+            pass
 
         time.sleep(POLL_INTERVAL)
 
